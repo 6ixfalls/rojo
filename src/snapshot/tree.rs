@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use rbx_dom_weak::{
@@ -11,6 +11,36 @@ use rbx_dom_weak::{
 use crate::{multimap::MultiMap, RojoRef};
 
 use super::{InstanceMetadata, InstanceSnapshot};
+
+/// Normalizes a path by resolving `.` and `..` components.
+/// This is needed to ensure that relative paths are properly resolved
+/// for file watching on UNIX systems.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = path.components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
+}
 
 /// An expanded variant of rbx_dom_weak's `WeakDom` that tracks additional
 /// metadata per instance that's Rojo-specific.
@@ -161,11 +191,13 @@ impl RojoTree {
                 // to this instance correctly.
                 if existing_metadata.relevant_paths != metadata.relevant_paths {
                     for existing_path in &existing_metadata.relevant_paths {
-                        self.path_to_ids.remove(existing_path, id);
+                        let normalized_existing_path = normalize_path(existing_path);
+                        self.path_to_ids.remove(&normalized_existing_path, id);
                     }
 
                     for new_path in &metadata.relevant_paths {
-                        self.path_to_ids.insert(new_path.clone(), id);
+                        let normalized_new_path = normalize_path(new_path);
+                        self.path_to_ids.insert(normalized_new_path, id);
                     }
                 }
                 if existing_metadata.specified_id != metadata.specified_id {
@@ -199,7 +231,8 @@ impl RojoTree {
     }
 
     pub fn get_ids_at_path(&self, path: &Path) -> &[Ref] {
-        self.path_to_ids.get(path)
+        let normalized_path = normalize_path(path);
+        self.path_to_ids.get(&normalized_path)
     }
 
     pub fn get_metadata(&self, id: Ref) -> Option<&InstanceMetadata> {
@@ -226,7 +259,8 @@ impl RojoTree {
 
     fn insert_metadata(&mut self, id: Ref, metadata: InstanceMetadata) {
         for path in &metadata.relevant_paths {
-            self.path_to_ids.insert(path.clone(), id);
+            let normalized_path = normalize_path(path);
+            self.path_to_ids.insert(normalized_path, id);
         }
 
         if let Some(specified_id) = &metadata.specified_id {
@@ -250,7 +284,8 @@ impl RojoTree {
         }
 
         for path in &metadata.relevant_paths {
-            self.path_to_ids.remove(path, id);
+            let normalized_path = normalize_path(path);
+            self.path_to_ids.remove(&normalized_path, id);
         }
     }
 }
@@ -380,7 +415,7 @@ mod test {
         RojoRef,
     };
 
-    use super::RojoTree;
+    use super::{normalize_path, RojoTree};
 
     #[test]
     fn swap_duped_specified_ids() {
@@ -397,5 +432,30 @@ mod test {
 
         tree.remove(original);
         assert_eq!(tree.get_specified_id(&custom_ref.clone()), Some(duped));
+    }
+
+    #[test]
+    fn normalize_path_resolves_relative_components() {
+        use std::path::PathBuf;
+
+        // Test resolving current directory references
+        let path = PathBuf::from("./src/test");
+        let normalized = normalize_path(&path);
+        assert_eq!(normalized, PathBuf::from("src/test"));
+
+        // Test resolving parent directory references
+        let path = PathBuf::from("../src/test");
+        let normalized = normalize_path(&path);
+        assert_eq!(normalized, PathBuf::from("src/test"));
+
+        // Test complex path with multiple relative components
+        let path = PathBuf::from("src/../lib/./test/../file.txt");
+        let normalized = normalize_path(&path);
+        assert_eq!(normalized, PathBuf::from("lib/file.txt"));
+
+        // Test absolute path
+        let path = PathBuf::from("/Users/test/./project/../src/file.txt");
+        let normalized = normalize_path(&path);
+        assert_eq!(normalized, PathBuf::from("/Users/test/src/file.txt"));
     }
 }
